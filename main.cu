@@ -11,6 +11,16 @@
 __constant__ float fdtd_coeff[4]={1225./1024, 245./3072, 49./5120, 5./7168};
 
 
+#define CUDA_CHECK(call) do {                                           \
+	cudaError_t err__ = (call);                                           \
+	if (err__ != cudaSuccess) {                                           \
+		fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,       \
+				cudaGetErrorString(err__));                                 \
+		exit(1);                                                            \
+	}                                                                     \
+}while(0)
+
+
 void writeVTI(const float *data, int width, int depth, 
 		const std::string& filename, float dx = 1.0f, float dy = 1.0f, float dz = 1.0f){
 
@@ -64,12 +74,12 @@ __global__
 void kernel_dPdt(float *P1, float *P_1, float *Vx, float *Vy, float *vel, float *rho,
 				  int width, int depth, float dx, float dt){
 
-	int ix = threadIdx.x + threadIdx.x * blockIdx.x;
-	int iy = threadIdx.y + threadIdx.y * blockIdx.y;
+	int ix = threadIdx.x + blockDim.x * blockIdx.x;
+	int iy = threadIdx.y + blockDim.y * blockIdx.y;
 	int tid = ix + iy * width;
 
 	if(ix > 3 && ix < (width - 3) && iy > 3 && iy < (depth - 3)){
-		P1[tid] += -1 * dt * dt * vel[tid] * vel[tid] * rho[tid] * (
+		P1[tid] += -1 * dt * vel[tid] * vel[tid] * rho[tid] * (
 			fdtd_coeff[0] * (Vx[tid] - Vx[tid-1] + Vy[tid] - Vy[tid-1*width]) -
 			fdtd_coeff[1] * (Vx[tid+1] - Vx[tid-2] + Vy[tid+1*width] - Vy[tid-2*width]) +
 			fdtd_coeff[2] * (Vx[tid+2] - Vx[tid-3] + Vy[tid+2*width] - Vy[tid-3*width]) -
@@ -82,8 +92,8 @@ __global__
 void kernel_dVdt(float *P, float *Vx, float *Vy, float *rho,
 				  int width, int depth, float dx, float dy, float dt){
 
-	int ix = threadIdx.x + threadIdx.x * blockIdx.x;
-	int iy = threadIdx.y + threadIdx.y * blockIdx.y;
+	int ix = threadIdx.x + blockDim.x * blockIdx.x;
+	int iy = threadIdx.y + blockDim.y * blockIdx.y;
 	int tid = ix + iy * width;
 
 	if(ix > 2 && ix < (width - 4) && iy < depth){
@@ -107,8 +117,7 @@ void kernel_dVdt(float *P, float *Vx, float *Vy, float *rho,
 __global__
 void kernel_add_source(float *P, float *source, int time_sample, int sloc_x, int sloc_y,
 					   int width){
-	int ix = threadIdx.x;
-	P[ix + sloc_x + width * sloc_y] += 1.;
+	P[sloc_x + width * sloc_y] += 1.;
 }
 
 
@@ -116,17 +125,21 @@ void propagate(float *P1, float *P_1, float *Vx, float *Vy, float *rho, float *v
 			   float dx, float dy, float dt, int width, int depth, int time_samples){
 
 	dim3 block_size(16,16);
-	dim3 grid_size(width/16+1, depth/16+1);
+	dim3 grid_size((width+block_size.x-1)/block_size.x, (depth+block_size.y-1)/block_size.y);
 	float *P_h = (float *)malloc(width*depth*sizeof(float));
+
 
 	for(int c=0;c<time_samples;c++){
 		std::cout << "iteration: " << c << std::endl;
 		kernel_dVdt<<<grid_size, block_size>>>(P1,Vx,Vy,rho,width,depth,dx,dy,dt);
 		CHECK_CALL();
+		CUDA_CHECK(cudaDeviceSynchronize());
 		kernel_dPdt<<<grid_size, block_size>>>(P1,P_1,Vx,Vy,vel,rho,width,depth,dx,dt);
 		CHECK_CALL();
+		CUDA_CHECK(cudaDeviceSynchronize());
 		kernel_add_source<<<1,1>>>(P1,P1,c,width/2,depth/2,width);
 		CHECK_CALL();
+		CUDA_CHECK(cudaDeviceSynchronize());
 		cudaMemcpy(P_h,P1, width*depth*sizeof(float), cudaMemcpyDeviceToHost);
 		writeVTI(P_h,width,depth,"file_" + std::to_string(c) + ".vti",dx,dy);
 	}
@@ -137,11 +150,11 @@ void propagate(float *P1, float *P_1, float *Vx, float *Vy, float *rho, float *v
 
 int main(){
 
-	int model_width = 1024;
-	int model_depth = 1024;
+	int model_width = 128;
+	int model_depth = 128;
 
-	float dx = 12.5;
-	float dy = 12.5;
+	float dx = 25;
+	float dy = 25;
 	float dt = 1e-3;
 	float total_time = 3.0;
 	int time_samples = total_time / dt + 1;
@@ -172,6 +185,10 @@ int main(){
 	cudaMemcpy(vel_model_d, vel_model_h.data(), model_width * model_depth * sizeof(float), cudaMemcpyHostToDevice);
 	cudaMemcpy(rho_model_d, rho_model_h.data(), model_width * model_depth * sizeof(float), cudaMemcpyHostToDevice);
 
+	cudaMemset(P1, 0, model_width*model_depth*sizeof(float));
+	cudaMemset(P_1, 0, model_width*model_depth*sizeof(float));
+	cudaMemset(Vx, 0, model_width*model_depth*sizeof(float));
+	cudaMemset(Vy, 0, model_width*model_depth*sizeof(float));
 	propagate(P1,P_1,Vx,Vy,rho_model_d,vel_model_d,dx,dy,dt,model_width,model_depth,time_samples);
 
 	cudaFree(vel_model_d);
