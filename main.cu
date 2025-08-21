@@ -2,6 +2,8 @@
 #include<vector>
 #include<source_location>
 #include<fstream>
+#include<iomanip>
+#include<stdexcept>
 #include<cuda.h>
 #include<cuda_runtime.h>
 
@@ -9,14 +11,51 @@
 __constant__ float fdtd_coeff[4]={1225./1024, 245./3072, 49./5120, 5./7168};
 
 
+void writeVTI(const float *data, int width, int depth, 
+		const std::string& filename, float dx = 1.0f, float dy = 1.0f, float dz = 1.0f){
+
+	std::ofstream ofs(filename);
+	if(!ofs){
+		throw std::runtime_error("Could not open file for writing: " + filename);
+	}
+
+	int nx = width;
+	int ny = depth;
+	int nz = 1; // 2D slice, but stored as 3D grid with 1 layer
+
+	ofs << R"(<?xml version="1.0"?>)" << "\n";
+	ofs << R"(<VTKFile type="ImageData" version="0.1" byte_order="LittleEndian">)" << "\n";
+	ofs << "  <ImageData WholeExtent=\"0 " << (nx-1) 
+		<< " 0 " << (ny-1) 
+		<< " 0 " << (nz-1) 
+		<< "\" Origin=\"0 0 0\" Spacing=\"" << dx << " " << dy << " " << dz << "\">\n";
+	ofs << "    <Piece Extent=\"0 " << (nx-1) 
+		<< " 0 " << (ny-1) 
+		<< " 0 " << (nz-1) << "\">\n";
+	ofs << "      <PointData Scalars=\"field\">\n";
+	ofs << "        <DataArray type=\"Float32\" Name=\"field\" format=\"ascii\">\n";
+
+	ofs << std::fixed << std::setprecision(6);
+	for (int j = 0; j < ny; ++j) {
+		for (int i = 0; i < nx; ++i) {
+			ofs << data[j * nx + i] << " ";
+		}
+		ofs << "\n";
+	}
+
+	ofs << "        </DataArray>\n";
+	ofs << "      </PointData>\n";
+	ofs << "      <CellData/>\n";
+	ofs << "    </Piece>\n";
+	ofs << "  </ImageData>\n";
+	ofs << "</VTKFile>\n";
+}
+
+
 void CHECK_CALL(){
 	cudaError err = cudaGetLastError();
 	if(err  != cudaSuccess){
-		//std::source_location location = std::source_location::current();
 		std::cout << "Cuda error: " << err << std::endl;
-			/*":"
-			<< location.file_name() << ":"
-			<< location.line() << std::endl;*/
 	}
 }
 
@@ -73,20 +112,12 @@ void kernel_add_source(float *P, float *source, int time_sample, int sloc_x, int
 }
 
 
-void save_wavefield(float *P_h, float *P_d, int width, int depth, int it){
-
-	cudaMemcpy(P_h, P_d, width * depth * sizeof(float), cudaMemcpyDeviceToHost);
-	std::ofstream out_stream("wavefield.bin", std::ios::binary);
-	out_stream.seekp(it*width*depth*sizeof(float));
-
-}
-
-
 void propagate(float *P1, float *P_1, float *Vx, float *Vy, float *rho, float *vel,
 			   float dx, float dy, float dt, int width, int depth, int time_samples){
 
 	dim3 block_size(16,16);
 	dim3 grid_size(width/16+1, depth/16+1);
+	float *P_h = (float *)malloc(width*depth*sizeof(float));
 
 	for(int c=0;c<time_samples;c++){
 		std::cout << "iteration: " << c << std::endl;
@@ -96,7 +127,11 @@ void propagate(float *P1, float *P_1, float *Vx, float *Vy, float *rho, float *v
 		CHECK_CALL();
 		kernel_add_source<<<1,1>>>(P1,P1,c,width/2,depth/2,width);
 		CHECK_CALL();
+		cudaMemcpy(P_h,P1, width*depth*sizeof(float), cudaMemcpyDeviceToHost);
+		writeVTI(P_h,width,depth,"file_" + std::to_string(c) + ".vti",dx,dy);
 	}
+
+	free(P_h);
 }
 
 
